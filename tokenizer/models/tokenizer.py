@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from .lpips import LPIPS
 from .nets import Encoder, Decoder
-from utils import LossWithIntermediateLosses
+from .utils import LossWithIntermediateLosses
 
 @dataclass
 class EncoderDecoderConfig:
