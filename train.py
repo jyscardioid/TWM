@@ -130,31 +130,54 @@ ctx = (
 )
 
 # poor man's data loader
+train_size, val_size = 1024, 128
 data_dir = os.path.join("data", dataset)
-train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
-val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+
+train_obs = np.memmap(
+    os.path.join(data_dir, "train_obs.bin"),
+    dtype=np.float64,
+    mode="r",
+    shape=(train_size, 201, 256),
+)
+train_action = np.memmap(
+    os.path.join(data_dir, "train_action.bin"),
+    dtype=np.uint16,
+    mode="r",
+    shape=(train_size, 200),
+)
+val_obs = np.memmap(
+    os.path.join(data_dir, "val_obs.bin"),
+    dtype=np.float64,
+    mode="r",
+    shape=(val_size, 201, 256),
+)
+val_action = np.memmap(
+    os.path.join(data_dir, "val_action.bin"),
+    dtype=np.uint16,
+    mode="r",
+    shape=(val_size, 200),
+)
 
 
 def get_batch(split):
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack(
-        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
-    )
-    y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
-            for i in ix
-        ]
-    )
+    data = (train_obs, train_action) if split == "train" else (val_obs, val_action)
+
+    ix = np.random.randint(len(data[0]), size=batch_size)
+
+    obs = torch.from_numpy(data[0][ix]).float()
+    x_obs = obs[:, :-1, :]
+    y_obs = obs[:, 1:, :]
+    x_action = torch.from_numpy(data[1][ix].astype(np.int64))
+
     if device_type == "cuda":
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
-        )
+        x_obs = x_obs.pin_memory().to(device, non_blocking=True)
+        y_obs = y_obs.pin_memory().to(device, non_blocking=True)
+        x_action = x_action.pin_memory().to(device, non_blocking=True)
+
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x_obs, y_obs, x_action = x_obs.to(device), y_obs.to(device), x_action.to(device)
+    return x_obs, x_action, y_obs
 
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -260,9 +283,9 @@ def estimate_loss():
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X_obs, X_action, Y_obs = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X_obs, X_action, Y_obs)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -291,7 +314,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch("train")  # fetch the very first batch
+X_obs, X_action, Y_obs = get_batch("train")  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -346,12 +369,12 @@ while True:
                 micro_step == gradient_accumulation_steps - 1
             )
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X_obs, X_action, Y_obs)
             loss = (
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch("train")
+        X_obs, X_action, Y_obs = get_batch("train")
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
