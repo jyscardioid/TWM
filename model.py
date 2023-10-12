@@ -200,28 +200,38 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, X_obs, X_action, Y_obs=None):
+        device = X_obs.device
+        b, t = X_action.size()
+        assert X_obs.size()[1] == t
+        t = t * 2
         assert (
             t <= self.config.block_size
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        tok_emb_action = self.transformer.wte(X_action)  # token embeddings of shape (b, t, n_embd)
+        tok_emb_obs = X_obs
+
+        # from: https://stackoverflow.com/questions/61026393/pytorch-concatenate-rows-in-alternate-order
+        tok_emb = torch.cat([tok_emb_obs, tok_emb_action], dim=-1).view(len(tok_emb_action), -1, tok_emb_action.shape[-1])
+
+
         pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
+        if Y_obs is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
-            )
+            # logits = self.lm_head(x)
+            # loss = F.cross_entropy(
+            #     logits.view(-1, logits.size(-1)), Y_obs.view(-1), ignore_index=-1
+            # )
+            loss = F.mse_loss(x[:, 1::2, :], Y_obs)
+            logits = None
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(
